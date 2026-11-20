@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Serve Speed</title>
+<style>
+  :root {
+    --bg: #000;
+    --fg: #fff;
+    --dim: #6b6b6b;
+    --faint: #2a2a2a;
+    --fresh: #d4ff3a;      /* tennis-ball yellow: a new reading */
+    --ok: #3ad46b;
+    --bad: #ff5a4f;
+    --font: "SF Pro Display", -apple-system, "Helvetica Neue", Arial, sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; background: var(--bg); color: var(--fg); overflow: hidden; }
+  body {
+    font-family: var(--font);
+    font-variant-numeric: tabular-nums;
+    display: grid;
+    grid-template-rows: 1fr auto auto;
+    user-select: none;
+    cursor: none;
+  }
+  body:hover { cursor: default; }
+
+  .reading {
+    display: flex; align-items: center; justify-content: center;
+    gap: 2.5vmin; min-height: 0;
+  }
+  .value {
+    font-weight: 800; line-height: 1; letter-spacing: -0.005em;
+    transition: color 1.2s ease;
+  }
+  .unit {
+    font-weight: 700; color: var(--dim); line-height: 1;
+    writing-mode: vertical-rl; transform: rotate(180deg);
+    letter-spacing: 0.08em;
+  }
+  .meta { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2.5vh; }
+  .err { font-size: 3.2vh; color: var(--dim); font-weight: 600; min-height: 1em; }
+
+  #speed .value { font-size: min(56vh, 34vw); }
+  #speed .unit  { font-size: min(9vh, 5.5vw); }
+  #spin  .value { font-size: min(25vh, 15vw); }
+  #spin  .unit  { font-size: min(6vh, 4vw); }
+  #spin { padding-bottom: 3vh; }
+
+  .empty .value { color: var(--faint); }
+  .fresh .value { color: var(--fresh); animation: pop 0.35s ease-out; }
+  @keyframes pop { from { transform: scale(1.06); } to { transform: scale(1); } }
+
+  footer {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 1.2vh 2.5vw 1.6vh; color: var(--dim); font-size: 2.2vh; gap: 2vw;
+  }
+  #history { display: flex; gap: 2.5vw; white-space: nowrap; overflow: hidden; }
+  #history span b { color: #bbb; font-weight: 700; }
+  #status { display: flex; align-items: center; gap: 0.8vw; white-space: nowrap; }
+  #dot { width: 1.4vh; height: 1.4vh; border-radius: 50%; background: var(--bad); }
+  #dot.on { background: var(--ok); }
+  .hide-footer footer { visibility: hidden; }
+
+  #cam {
+    /* bottom-right, beside the RPM row: the one corner the big numbers never use */
+    position: fixed; bottom: 7vh; right: 1.5vw; width: min(20vw, 36vh * 16 / 9);
+    aspect-ratio: 16 / 9; background: #111; border: 1px solid #333; border-radius: 6px;
+    overflow: hidden; display: none;
+  }
+  #cam.on { display: block; }
+  #cam img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  #cam span {
+    position: absolute; top: 6px; left: 8px; font-size: 1.6vh; font-weight: 700;
+    color: #fff; background: rgba(200, 30, 30, 0.85); padding: 1px 6px; border-radius: 3px;
+    letter-spacing: 0.06em;
+  }
+  .hide-cam #cam { display: none !important; }
+  @media (max-aspect-ratio: 3/2) { #cam { width: 16vw; } }               /* 4:3-ish: RPM row is wider */
+  @media (max-aspect-ratio: 6/5) { #cam { display: none !important; } }  /* portrait: no free corner */
+
+  #help {
+    position: fixed; inset: auto 2.5vw 6vh auto; background: #111; color: #ccc;
+    border: 1px solid #333; border-radius: 8px; padding: 1.2em 1.5em; font-size: 15px;
+    line-height: 1.7; display: none;
+  }
+  #help.show { display: block; }
+  kbd { background: #222; border: 1px solid #444; border-radius: 4px; padding: 0 6px; font-family: inherit; }
+</style>
+</head>
+<body class="">
+  <section class="reading empty" id="speed">
+    <div class="value">—</div>
+    <div class="meta"><div class="unit">MPH</div><div class="err"></div></div>
+  </section>
+  <section class="reading empty" id="spin">
+    <div class="value">—</div>
+    <div class="meta"><div class="unit">RPM</div><div class="err"></div></div>
+  </section>
+  <footer>
+    <div id="history"></div>
+    <div id="status"><span id="age"></span><span id="dot"></span><span id="conn">connecting</span></div>
+  </footer>
+  <div id="cam"><img id="camimg" alt=""><span>LIVE</span></div>
+  <div id="help">
+    <kbd>F</kbd> full screen &nbsp; <kbd>U</kbd> mph / km/h<br>
+    <kbd>D</kbd> demo reading &nbsp; <kbd>H</kbd> hide footer<br>
+    <kbd>V</kbd> show / hide camera<br>
+    <kbd>?</kbd> close this
+  </div>
+
+<script>
+(() => {
+  const MPS_TO = { mph: 2.2369363, kmh: 3.6 };
+  const UNIT_LABEL = { mph: "MPH", kmh: "KM/H" };
+  const FRESH_MS = 6000;
+
+  const store = {
+    get(k, d) { try { return localStorage.getItem(k) ?? d; } catch { return d; } },
+    set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+  };
+  let unit = store.get("unit", "mph");
+  if (!MPS_TO[unit]) unit = "mph";
+  if (store.get("hideFooter", "0") === "1") document.body.classList.add("hide-footer");
+  if (store.get("hideCam", "0") === "1") document.body.classList.add("hide-cam");
+
+  const $ = (s) => document.querySelector(s);
+  const speedEl = $("#speed"), spinEl = $("#spin");
+  let history = [];         // shots, most recent last
+  let freshTimer = null;
+
+  const fmtSpeed = (mps) => Math.round(mps * MPS_TO[unit]).toString();
+  const fmtRpm = (r) => (Math.round(r / 10) * 10).toLocaleString("en-US");
+
+  function setReading(el, text, errText) {
+    el.querySelector(".value").textContent = text ?? "—";
+    el.querySelector(".err").textContent = errText ?? "";
+    el.classList.toggle("empty", text == null);
+  }
+
+  function render(markFresh) {
+    $("#speed .unit").textContent = UNIT_LABEL[unit];
+    const s = history[history.length - 1];
+    if (!s) {
+      setReading(speedEl, null); setReading(spinEl, null);
+    } else {
+      setReading(speedEl,
+        s.speed_mps == null ? null : fmtSpeed(s.speed_mps),
+        s.speed_err_mps == null ? "" : "±" + (s.speed_err_mps * MPS_TO[unit]).toFixed(1));
+      setReading(spinEl,
+        s.rpm == null ? null : fmtRpm(s.rpm),
+        s.rpm_err == null ? "" : "±" + fmtRpm(s.rpm_err));
+    }
+    if (markFresh) {
+      for (const el of [speedEl, spinEl]) {
+        el.classList.remove("fresh"); void el.offsetWidth; el.classList.add("fresh");
+      }
+      clearTimeout(freshTimer);
+      freshTimer = setTimeout(() => { speedEl.classList.remove("fresh"); spinEl.classList.remove("fresh"); }, FRESH_MS);
+    }
+    $("#history").innerHTML = history.slice(-7, -1).reverse().map((h) =>
+      `<span><b>${h.speed_mps == null ? "—" : fmtSpeed(h.speed_mps)}</b> ${UNIT_LABEL[unit].toLowerCase()}` +
+      (h.rpm == null ? "" : ` · ${fmtRpm(h.rpm)} rpm`) + `</span>`).join("");
+    tickAge();
+  }
+
+  function tickAge() {
+    const s = history[history.length - 1];
+    if (!s) { $("#age").textContent = ""; return; }
+    const sec = Math.max(0, Math.round((Date.now() - s.t) / 1000));
+    $("#age").textContent = sec < 60 ? `${sec}s ago` : `${Math.round(sec / 60)}m ago`;
+  }
+  setInterval(tickAge, 1000);
+
+  function addShot(shot) {
+    history = [...history, shot].slice(-20);
+    render(true);
+  }
+
+  // ---- live connection (EventSource reconnects on its own) ----
+  function connect() {
+    const es = new EventSource("/events");
+    es.onopen = () => { $("#dot").classList.add("on"); $("#conn").textContent = "live"; };
+    es.onerror = () => { $("#dot").classList.remove("on"); $("#conn").textContent = "reconnecting"; };
+    es.addEventListener("history", (e) => { history = JSON.parse(e.data); render(false); });
+    es.addEventListener("shot", (e) => addShot(JSON.parse(e.data)));
+  }
+  if (location.protocol.startsWith("http")) connect();
+  else { $("#conn").textContent = "offline (open via the server)"; }
+
+  // ---- live camera preview (only when the tracker is streaming) ----
+  const cam = $("#cam"), camImg = $("#camimg");
+  let camRetry = null;
+  function loadCam() {
+    clearTimeout(camRetry);
+    camImg.src = "/video.mjpg?" + Date.now();
+  }
+  camImg.onload = () => cam.classList.add("on");
+  camImg.onerror = () => { cam.classList.remove("on"); camRetry = setTimeout(loadCam, 3000); };
+  if (location.protocol.startsWith("http")) loadCam();
+
+  // ---- keep the laptop screen awake ----
+  let wakeLock = null;
+  async function keepAwake() {
+    try { if ("wakeLock" in navigator && document.visibilityState === "visible") wakeLock = await navigator.wakeLock.request("screen"); }
+    catch {}
+  }
+  document.addEventListener("visibilitychange", keepAwake);
+  keepAwake();
+
+  // ---- keys ----
+  document.addEventListener("keydown", (e) => {
+    const k = e.key.toLowerCase();
+    if (k === "f") {
+      if (document.fullscreenElement) document.exitFullscreen?.();
+      else document.documentElement.requestFullscreen?.().catch(() => {});
+    } else if (k === "u") {
+      unit = unit === "mph" ? "kmh" : "mph"; store.set("unit", unit); render(false);
+    } else if (k === "h") {
+      const on = document.body.classList.toggle("hide-footer"); store.set("hideFooter", on ? "1" : "0");
+    } else if (k === "d") {
+      // local-only fake reading for checking readability from a distance
+      const mph = 70 + Math.random() * 60;
+      addShot({ id: -Date.now(), t: Date.now(), speed_mps: mph / MPS_TO.mph, speed_err_mps: 0.3,
+                rpm: Math.random() < 0.85 ? 800 + Math.random() * 3200 : null, rpm_err: 120 });
+    } else if (k === "v") {
+      const off = document.body.classList.toggle("hide-cam"); store.set("hideCam", off ? "1" : "0");
+      if (!off) loadCam();
+    } else if (k === "?" || k === "/") {
+      $("#help").classList.toggle("show");
+    }
+  });
+  render(false);
+})();
+</script>
+</body>
+</html>

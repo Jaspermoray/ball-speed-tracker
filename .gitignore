@@ -1,0 +1,18 @@
+# environment and downloaded tools (setup.sh recreates these)
+.venv/
+tools/
+__pycache__/
+*.pyc
+
+# your recordings and results: videos can contain GPS location metadata
+*.mp4
+*.mov
+*.mkv
+*.h264
+recordings/
+analysis/
+pts.csv
+
+# local state
+.last_phone_ip
+.DS_Store
