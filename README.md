@@ -28,7 +28,7 @@ Measure tennis ball speed live with an Android phone's **240 fps** slow-motion c
 You need Python 3.10 or newer ([python.org](https://www.python.org/downloads/)).
 
 ```bash
-git clone <this-repo-url> ball-speed-tracker
+git clone https://github.com/Jaspermoray/ball-speed-tracker.git
 cd ball-speed-tracker
 ./setup.sh
 ```
