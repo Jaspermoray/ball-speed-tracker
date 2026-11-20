@@ -170,6 +170,7 @@ class ScrcpyCamera:
         if "\tdevice" not in devs:
             raise ScrcpyError(f"no authorized device:\n{devs}")
 
+        self._kill_stale_servers()
         self._adb("push", str(self.dir / "scrcpy-server"), DEVICE_SERVER_PATH)
         name = f"scrcpy_{self.scid:08x}"
         self.port = int(self._adb("forward", "tcp:0", f"localabstract:{name}").stdout.strip())
@@ -291,6 +292,19 @@ class ScrcpyCamera:
             except ScrcpyError:
                 pass
             self.port = None
+
+    def _kill_stale_servers(self):
+        """Stop camera servers left behind by earlier runs that didn't shut down
+        cleanly (closed terminal, lost link). They fight the new session for
+        the camera. Matches only servers launched by this project."""
+        pat = "'[c]om.genymobile.scrcpy.Server.*video_source=camera.*camera_high_speed'"
+        base = [self.adb] + (["-s", self.serial] if self.serial else []) + ["shell"]
+        r = subprocess.run(base + [f"pgrep -f {pat}"], capture_output=True, text=True)
+        pids = r.stdout.split()
+        if pids:
+            subprocess.run(base + [f"pkill -f {pat}"], capture_output=True)
+            self._log(f"[client] stopped {len(pids)} leftover camera server(s) from an earlier run")
+            time.sleep(0.5)
 
     def _wait_device_server_exit(self, timeout_s: float = 3.0):
         """The device-side server keeps the camera open until it notices the

@@ -22,6 +22,7 @@ import av
 import cv2
 import numpy as np
 
+from tracker.device_health import explain_no_frames, phone_state
 from tracker.display import DisplayServer
 from tracker.frames import Decoder
 from tracker.live_shots import SCALE, ShotDetector, ShotResult
@@ -36,31 +37,43 @@ TRAIL_S = 4.0            # how long the last shot's path stays drawn on the prev
 
 def preview_loop(disp: DisplayServer, latest: dict, det: ShotDetector, stop: threading.Event):
     """Encode the newest frame as a small JPEG ~15 times a second, with the ball
-    the trigger currently sees and the path of the last shot drawn on it."""
-    last_id = None
+    the trigger currently sees and the path of the last shot drawn on it.
+
+    Runs alongside the tracker and reads its state without locks, so it takes
+    snapshots (a shot ending can clear det.recent_hits at any moment), and a
+    failure in one frame is logged once and skipped. The feed must never die."""
+    last = None
+    errors = 0
     while not stop.is_set():
         t0 = time.monotonic()
         fr = latest.get("frame")
-        if fr is not None and id(fr) != last_id:
-            last_id = id(fr)
-            img = fr.reformat(width=PREVIEW_W, height=PREVIEW_H, format="bgr24").to_ndarray()
-            k = PREVIEW_W / fr.width
-            shot = latest.get("shot")
-            if shot and time.monotonic() - shot[0] < TRAIL_S:
-                pts = np.array([[d.x * k, d.y * k] for d in shot[1].detections], np.int32)
-                if len(pts) > 1:
-                    cv2.polylines(img, [pts], False, (0, 255, 212), 2, cv2.LINE_AA)
-            sd = det.recent_hits[-1] if det.recent_hits else None
-            if sd is not None:
-                ks = k * SCALE
-                cv2.circle(img, (int(sd.x * ks), int(sd.y * ks)),
-                           max(6, int(sd.d_major * ks * 0.7)), (0, 255, 212), 2, cv2.LINE_AA)
-            if det.active:
-                cv2.putText(img, "SHOT", (PREVIEW_W - 90, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
-                            (0, 255, 212), 2, cv2.LINE_AA)
-            ok, jpg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 70])
-            if ok:
-                disp.set_preview(jpg.tobytes())
+        if fr is not None and fr is not last:
+            last = fr
+            try:
+                img = fr.reformat(width=PREVIEW_W, height=PREVIEW_H, format="bgr24").to_ndarray()
+                k = PREVIEW_W / fr.width
+                shot = latest.get("shot")
+                if shot and time.monotonic() - shot[0] < TRAIL_S:
+                    pts = np.array([[d.x * k, d.y * k] for d in shot[1].detections], np.int32)
+                    if len(pts) > 1:
+                        cv2.polylines(img, [pts], False, (0, 255, 212), 2, cv2.LINE_AA)
+                hits = list(det.recent_hits)                 # snapshot: may be cleared any time
+                sd = hits[-1] if hits else None
+                if sd is not None:
+                    ks = k * SCALE
+                    cv2.circle(img, (int(sd.x * ks), int(sd.y * ks)),
+                               max(6, int(sd.d_major * ks * 0.7)), (0, 255, 212), 2, cv2.LINE_AA)
+                if det.active is not None:
+                    cv2.putText(img, "SHOT", (PREVIEW_W - 90, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                                (0, 255, 212), 2, cv2.LINE_AA)
+                ok, jpg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                if ok:
+                    disp.set_preview(jpg.tobytes())
+            except Exception as e:  # keep the feed alive whatever happens to one frame
+                errors += 1
+                if errors in (1, 100, 10000):
+                    print(f"[preview] frame skipped ({errors} so far): {type(e).__name__}: {e}",
+                          flush=True)
         stop.wait(max(0.0, 1 / PREVIEW_FPS - (time.monotonic() - t0)))
 
 
@@ -79,7 +92,17 @@ def report(res: ShotResult, disp: DisplayServer | None, min_mph: float, latest: 
           f"(3D {s.speed_3d * MPH:.1f}; frames {s.first_frame}-{s.last_frame}, n={s.n}{grav}; "
           f"all segments: {segs}; analysis {res.analysis_ms:.0f} ms)", flush=True)
     if disp and mph >= min_mph:
-        disp.publish(speed_mps=s.speed_2d, speed_err_mps=s.speed_2d_err)
+        shown = disp.publish(speed_mps=s.speed_2d, speed_err_mps=s.speed_2d_err)
+        latest.setdefault("shown", {})[res.index] = shown["id"]
+
+
+def report_spin(res: ShotResult, disp: DisplayServer | None, latest: dict):
+    sp = res.spin
+    print(f"[shot {res.index}] spin: " + (sp.label() if sp else "not enough frames")
+          + f"  [{res.spin_ms:.0f} ms]", flush=True)
+    shown = latest.get("shown", {}).pop(res.index, None)
+    if disp and shown is not None and sp is not None and sp.reliable:
+        disp.update(shown, rpm=sp.rpm, rpm_err=sp.rpm_err)
 
 
 # ------------------------------------------------------------------ sources
@@ -129,6 +152,23 @@ def live_frames(args, stop: threading.Event, stats: dict):
             q.put(None)
 
     threading.Thread(target=reader, daemon=True).start()
+
+    def watchdog():
+        """Connected but no video? Ask the phone why, instead of waiting silently."""
+        warned_at = None
+        while not stop.is_set():
+            stop.wait(1.0)
+            idle = time.monotonic() - stats.get("last_packet", t_connect)
+            if idle >= 4.0 and (warned_at is None or time.monotonic() - warned_at > 15):
+                warned_at = time.monotonic()
+                why = explain_no_frames(phone_state(cam.adb, args.serial))
+                print(f"[client] no video from the phone for {idle:.0f} s: {why}", flush=True)
+            elif idle < 1.0 and warned_at is not None:
+                print("[client] video is flowing again", flush=True)
+                warned_at = None
+
+    t_connect = time.monotonic()
+    threading.Thread(target=watchdog, daemon=True).start()
     dec = Decoder(cam.codec, threads=args.decode_threads)
     min_off = None
     try:
@@ -137,6 +177,7 @@ def live_frames(args, stop: threading.Event, stats: dict):
             if item is None:
                 break
             stats["qsize"] = q.qsize()
+            stats["last_packet"] = time.monotonic()
             if not item.config:
                 off = item.arrival_ns / 1e6 - item.pts_us / 1e3
                 min_off = off if min_off is None else min(min_off, off)
@@ -165,6 +206,7 @@ def main():
     ap.add_argument("--min-mph", type=float, default=3.0,
                     help="don't publish shots slower than this (rolls, nudges)")
     ap.add_argument("--duration", type=float, help="stop after this many seconds")
+    ap.add_argument("--no-spin", action="store_true", help="don't estimate spin (RPM)")
     args = ap.parse_args()
 
     disp = None
@@ -177,7 +219,8 @@ def main():
     stop = threading.Event()
     stats: dict = {}
     latest: dict = {}
-    det = ShotDetector(lambda r: report(r, disp, args.min_mph, latest))
+    det = ShotDetector(lambda r: report(r, disp, args.min_mph, latest), spin=not args.no_spin,
+                       on_spin=lambda r: report_spin(r, disp, latest))
     if disp and not args.no_preview:
         threading.Thread(target=preview_loop, args=(disp, latest, det, stop), daemon=True).start()
     src = (file_frames(args.file, not args.fast, stop) if args.file

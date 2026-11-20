@@ -78,8 +78,10 @@
     letter-spacing: 0.06em;
   }
   .hide-cam #cam { display: none !important; }
-  @media (max-aspect-ratio: 3/2) { #cam { width: 16vw; } }               /* 4:3-ish: RPM row is wider */
-  @media (max-aspect-ratio: 6/5) { #cam { display: none !important; } }  /* portrait: no free corner */
+  @media (max-aspect-ratio: 3/2) { #cam { width: 16vw; } }   /* 4:3-ish: RPM row is wider */
+  @media (max-aspect-ratio: 1/1) { #cam { width: 22vw; } }   /* tall windows: digits are width-limited, room on the right */
+  #camnote { display: none; }
+  .hide-cam #camnote.avail { display: inline; }
 
   #help {
     position: fixed; inset: auto 2.5vw 6vh auto; background: #111; color: #ccc;
@@ -101,7 +103,7 @@
   </section>
   <footer>
     <div id="history"></div>
-    <div id="status"><span id="age"></span><span id="dot"></span><span id="conn">connecting</span></div>
+    <div id="status"><span id="camnote">camera hidden (V) ·</span><span id="age"></span><span id="dot"></span><span id="conn">connecting</span></div>
   </footer>
   <div id="cam"><img id="camimg" alt=""><span>LIVE</span></div>
   <div id="help">
@@ -186,20 +188,51 @@
     es.onerror = () => { $("#dot").classList.remove("on"); $("#conn").textContent = "reconnecting"; };
     es.addEventListener("history", (e) => { history = JSON.parse(e.data); render(false); });
     es.addEventListener("shot", (e) => addShot(JSON.parse(e.data)));
+    es.addEventListener("update", (e) => {            // e.g. rpm arriving after the speed
+      const u = JSON.parse(e.data);
+      const i = history.findIndex((h) => h.id === u.id);
+      if (i < 0) return;
+      history[i] = u;
+      render(false);
+      if (i === history.length - 1) {
+        spinEl.classList.remove("fresh"); void spinEl.offsetWidth; spinEl.classList.add("fresh");
+      }
+    });
   }
   if (location.protocol.startsWith("http")) connect();
   else { $("#conn").textContent = "offline (open via the server)"; }
 
-  // ---- live camera preview (only when the tracker is streaming) ----
-  const cam = $("#cam"), camImg = $("#camimg");
-  let camRetry = null;
-  function loadCam() {
-    clearTimeout(camRetry);
-    camImg.src = "/video.mjpg?" + Date.now();
+  // ---- live camera preview ----
+  // Polls single JPEG frames (/frame.jpg) rather than a motion-JPEG stream:
+  // browsers handle plain image fetches consistently, while MJPEG in <img>
+  // varies (Safari, headless Chrome). Each frame is fetched, then swapped in
+  // once complete, so there's no flicker. The box shows only while frames
+  // are coming.
+  const cam = $("#cam"), camImg = $("#camimg"), camNote = $("#camnote");
+  const CAM_INTERVAL_MS = 80;            // ~12 fps is plenty for aiming
+  let camUrl = null, camFails = 0;
+  async function camLoop() {
+    let ok = false;
+    const hidden = document.body.classList.contains("hide-cam");
+    try {
+      const r = await fetch("/frame.jpg?" + Date.now(), { cache: "no-store" });
+      if (r.ok) {
+        ok = true;
+        if (!hidden) {
+          const url = URL.createObjectURL(await r.blob());
+          await new Promise((res) => { camImg.onload = camImg.onerror = res; camImg.src = url; });
+          if (camUrl) URL.revokeObjectURL(camUrl);
+          camUrl = url;
+        }
+      }
+    } catch {}
+    camFails = ok ? 0 : camFails + 1;
+    const live = camFails < 3;                     // tolerate a blip before hiding
+    camNote.classList.toggle("avail", live);
+    cam.classList.toggle("on", live && !hidden);
+    setTimeout(camLoop, ok ? CAM_INTERVAL_MS : 1000);
   }
-  camImg.onload = () => cam.classList.add("on");
-  camImg.onerror = () => { cam.classList.remove("on"); camRetry = setTimeout(loadCam, 3000); };
-  if (location.protocol.startsWith("http")) loadCam();
+  if (location.protocol.startsWith("http")) camLoop();
 
   // ---- keep the laptop screen awake ----
   let wakeLock = null;
@@ -227,7 +260,7 @@
                 rpm: Math.random() < 0.85 ? 800 + Math.random() * 3200 : null, rpm_err: 120 });
     } else if (k === "v") {
       const off = document.body.classList.toggle("hide-cam"); store.set("hideCam", off ? "1" : "0");
-      if (!off) loadCam();
+      cam.classList.toggle("on", !off && camFails < 3);
     } else if (k === "?" || k === "/") {
       $("#help").classList.toggle("show");
     }

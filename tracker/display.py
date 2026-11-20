@@ -36,6 +36,7 @@ class DisplayServer:
         # live camera preview (motion JPEG)
         self._preview: bytes | None = None
         self._preview_seq = 0
+        self._preview_t = 0.0
         self._preview_cond = threading.Condition()
 
     # ---- public API ---------------------------------------------------------
@@ -59,6 +60,25 @@ class DisplayServer:
                     server._serve_events(self)
                 elif self.path.split("?")[0] == "/video.mjpg":
                     server._serve_mjpeg(self)
+                elif self.path.split("?")[0] == "/frame.jpg":
+                    jpg = server._preview
+                    if jpg is None or time.time() - server._preview_t > 3.0:
+                        self.send_error(HTTPStatus.SERVICE_UNAVAILABLE, "no camera preview")
+                        return
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "image/jpeg")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Length", str(len(jpg)))
+                    self.end_headers()
+                    self.wfile.write(jpg)
+                elif self.path.split("?")[0] == "/status":
+                    body = json.dumps({"preview": time.time() - server._preview_t < 3.0}).encode()
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
                 else:
                     self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -99,7 +119,20 @@ class DisplayServer:
             self._next_id += 1
             self._history = (self._history + [shot])[-20:]
             for q in self._clients:
-                q.put(shot)
+                q.put(("shot", shot))
+        return shot
+
+    def update(self, shot_id: int, **fields) -> dict | None:
+        """Fill in more of an already-published shot (e.g. rpm once spin is done)."""
+        with self._lock:
+            shot = next((h for h in self._history if h["id"] == shot_id), None)
+            if shot is None:
+                return None
+            for k in ("speed_mps", "speed_err_mps", "rpm", "rpm_err"):
+                if k in fields:
+                    shot[k] = None if fields[k] is None else float(fields[k])
+            for q in self._clients:
+                q.put(("update", dict(shot)))
         return shot
 
     def set_preview(self, jpeg: bytes):
@@ -107,6 +140,7 @@ class DisplayServer:
         with self._preview_cond:
             self._preview = jpeg
             self._preview_seq += 1
+            self._preview_t = time.time()
             self._preview_cond.notify_all()
 
     def stop(self):
@@ -154,8 +188,8 @@ class DisplayServer:
             h.wfile.flush()
             while True:
                 try:
-                    shot = q.get(timeout=15)
-                    h.wfile.write(f"event: shot\ndata: {json.dumps(shot)}\n\n".encode())
+                    event, shot = q.get(timeout=15)
+                    h.wfile.write(f"event: {event}\ndata: {json.dumps(shot)}\n\n".encode())
                 except queue.Empty:
                     h.wfile.write(b": keepalive\n\n")
                 h.wfile.flush()

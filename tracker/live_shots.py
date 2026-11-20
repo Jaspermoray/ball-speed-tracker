@@ -27,6 +27,9 @@ import numpy as np
 
 from tracker.ball import (RECENT_S, Camera, Detection, SegmentSpeed, _changed, clean_segment,
                           detect, drop_partials, segment_speed, smooth, split_segments)
+from tracker.spin import SpinResult, ball_patch, estimate_spin
+
+SPIN_R = 20
 
 SCALE = 4                 # trigger works at 1/4 resolution
 BG_EVERY_S = 0.5          # background snapshot interval while idle
@@ -40,6 +43,7 @@ class Crop:
     x0: int
     y0: int
     cur: np.ndarray       # smoothed BGR crop, current frame
+    raw: np.ndarray       # unsmoothed crop (spin needs the fine surface detail)
     ref: np.ndarray | None  # same region, frame ~15 ms earlier
     bg: np.ndarray        # same region, background
 
@@ -53,6 +57,8 @@ class ShotResult:
     segments: list[SegmentSpeed]
     analysis_ms: float
     crops: int
+    spin: SpinResult | None = None
+    spin_ms: float = 0.0
 
     @property
     def shot(self) -> SegmentSpeed | None:
@@ -70,10 +76,15 @@ class _Active:
 
 class ShotDetector:
     def __init__(self, on_shot: Callable[[ShotResult], None], hfov_deg: float = 66.0,
+                 spin: bool = True, max_rpm: float = 6000,
+                 on_spin: Callable[[ShotResult], None] | None = None,
                  end_gap_s: float = 0.15, max_shot_s: float = 3.0, still_s: float = 0.3,
                  log: Callable[[str], None] = print):
         self.on_shot = on_shot
         self.hfov = hfov_deg
+        self.spin = spin
+        self.max_rpm = max_rpm
+        self.on_spin = on_spin
         self.end_gap_s = end_gap_s
         self.max_shot_s = max_shot_s
         self.still_s = still_s
@@ -204,10 +215,11 @@ class ShotDetector:
         y0 = max(0, int(cy) - half)
         x1 = min(self.width, int(cx) + half)
         y1 = min(self.height, int(cy) + half)
-        cur = smooth(self._bgr(i, frame)[y0:y1, x0:x1].copy())
+        raw = self._bgr(i, frame)[y0:y1, x0:x1].copy()
+        cur = smooth(raw)
         rf = self._ref_frame(t)
         ref = smooth(self._bgr(*rf)[y0:y1, x0:x1].copy()) if rf is not None else None
-        a.crops.append(Crop(i, t, x0, y0, cur, ref, self.full_bg[y0:y1, x0:x1].copy()))
+        a.crops.append(Crop(i, t, x0, y0, cur, raw, ref, self.full_bg[y0:y1, x0:x1].copy()))
 
     def _finish(self):
         a, self.active = self.active, None
@@ -221,13 +233,18 @@ class ShotDetector:
         while True:
             idx, a = self._q.get()
             try:
-                self.on_shot(self._analyse(idx, a))
+                res, seg0 = self._analyse(idx, a)
+                self.on_shot(res)                      # speed: report straight away
+                if self.spin and seg0:
+                    self._add_spin(res, a, seg0)       # spin: a second or two later
+                    if self.on_spin:
+                        self.on_spin(res)
             except Exception as e:  # never let one bad shot kill the worker
                 self.log(f"[shots] analysis of shot {idx} failed: {e}")
             finally:
                 self._q.task_done()
 
-    def _analyse(self, idx: int, a: _Active) -> ShotResult:
+    def _analyse(self, idx: int, a: _Active) -> tuple[ShotResult, list[Detection] | None]:
         t0 = time.perf_counter()
         dets: list[Detection] = []
         for c in a.crops:
@@ -242,5 +259,16 @@ class ShotDetector:
         segs = [s for s in (clean_segment(s) for s in split_segments(whole)) if s]
         cam = Camera(self.width, self.height, self.hfov)
         results = [segment_speed(s, cam) for s in segs]
-        return ShotResult(idx, a.start_t, a.crops[-1].t, dets, results,
-                          (time.perf_counter() - t0) * 1000, len(a.crops))
+        res = ShotResult(idx, a.start_t, a.crops[-1].t, dets, results,
+                         (time.perf_counter() - t0) * 1000, len(a.crops))
+        return res, (segs[0] if segs else None)
+
+    def _add_spin(self, res: ShotResult, a: _Active, s: list[Detection]):
+        t1 = time.perf_counter()
+        by_frame = {c.frame: c for c in a.crops}
+        patches = [ball_patch(by_frame[d.frame].raw, d, SPIN_R,
+                              by_frame[d.frame].x0, by_frame[d.frame].y0) for d in s]
+        dur = s[-1].t - s[0].t
+        vel = ((s[-1].x - s[0].x) / dur, (s[-1].y - s[0].y) / dur) if dur > 0 else (1.0, 0.0)
+        res.spin = estimate_spin(patches, s, vel, max_rpm=self.max_rpm)
+        res.spin_ms = (time.perf_counter() - t1) * 1000

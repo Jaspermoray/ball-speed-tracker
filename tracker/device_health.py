@@ -112,3 +112,47 @@ class HealthMonitor:
             out.append(f"thermal status max: {THERMAL_NAMES[mx] if mx < 7 else mx}"
                        + ("  << phone was throttling" if mx >= 2 else ""))
         return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# "Why aren't frames arriving?"
+# ---------------------------------------------------------------------------
+
+_STATE_CMD = ("dumpsys power | grep -m1 'mWakefulness='; dumpsys window | grep -m1 isKeyguardShowing; "
+              "echo stay_on=$(settings get global stay_on_while_plugged_in); "
+              "dumpsys battery | grep -E 'powered: true'")
+
+
+def phone_state(adb: str, serial: str | None) -> dict | None:
+    """Awake / locked / on power / Stay-awake, or None if adb can't reach the phone."""
+    cmd = [adb] + (["-s", serial] if serial else []) + ["shell", _STATE_CMD]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=8).stdout
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if "mWakefulness" not in out:
+        return None
+    m = re.search(r"stay_on=(\d+)", out)
+    return {
+        "awake": "mWakefulness=Awake" in out,
+        "locked": "isKeyguardShowing=true" in out,
+        "powered": "powered: true" in out,
+        "stay_awake": bool(m and m.group(1) != "0"),
+    }
+
+
+def explain_no_frames(state: dict | None) -> str:
+    if state is None:
+        return "the phone isn't answering adb: check the cable / Ethernet link."
+    tips = []
+    if not state["powered"]:
+        tips.append("the phone is NOT on power, so Stay awake can't keep it on: plug the "
+                    "power bank/charger into the hub's charging port")
+    if not state["awake"] or state["locked"]:
+        tips.append("the phone is asleep or locked (Android stops the camera): unlock it")
+    if not state["stay_awake"]:
+        tips.append("Stay awake is off (Developer options)")
+    if not tips:
+        return ("the phone is awake, unlocked and powered, so another app may have the camera "
+                "(close the Camera app), or restart the tracker.")
+    return "; ".join(tips) + "."

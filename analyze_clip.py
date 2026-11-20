@@ -26,6 +26,9 @@ import numpy as np
 
 from tracker.ball import (BALL_DIAMETER_M, Camera, background_median, clean_segment,
                           drop_partials, segment_speed, split_segments, track)
+from tracker.spin import ball_patch, estimate_spin
+
+SPIN_R = 20   # spin patch radius, px
 
 MPH = 2.2369363
 
@@ -74,6 +77,8 @@ def main():
     ap.add_argument("--out", help="output folder (default analysis/<clip>)")
     ap.add_argument("--publish", nargs="?", const="http://localhost:8765",
                     help="send the shot speed to the display server")
+    ap.add_argument("--no-spin", action="store_true", help="skip the spin (RPM) estimate")
+    ap.add_argument("--max-rpm", type=float, default=6000, help="spin search range")
     args = ap.parse_args()
 
     scale, desc = time_scale(args.video, args.capture_fps)
@@ -152,10 +157,14 @@ def main():
                     cv2.FONT_HERSHEY_SIMPLEX, 1.1, colours[k % len(colours)], 2)
     cv2.imwrite(str(out / "overlay.jpg"), ov)
 
-    # ---- crops around each detection in the first segment (QA) ----
+    # ---- one more pass: QA crops (first segment) and spin patches (all segments) ----
     want = {d.frame: d for d in segs[0]}
+    in_any = {d.frame: d for s in segs for d in s}
+    patches: dict[int, np.ndarray] = {}
     crops = []
     for i, _, f in frames(args.video, scale):
+        if i in in_any and not args.no_spin:
+            patches[i] = ball_patch(f, in_any[i], SPIN_R)
         if i in want and len(crops) < 16:
             d = want[i]
             r = int(max(d.d_major, 40))
@@ -172,8 +181,29 @@ def main():
                     np.vstack([np.hstack(crops[i:i + 8]) for i in range(0, len(crops), 8)]))
     print(f"\nwrote {out}/detections.csv, overlay.jpg, crops.jpg")
 
+    spin = None
+    if not args.no_spin:
+        print("\nspin:")
+        for k, s in enumerate(segs):
+            vel = ((s[-1].x - s[0].x) / (s[-1].t - s[0].t), (s[-1].y - s[0].y) / (s[-1].t - s[0].t))
+            sr = estimate_spin([patches[d.frame] for d in s], s, vel, max_rpm=args.max_rpm)
+            print(f"  segment {s[0].frame}-{s[-1].frame}: " + (sr.label() if sr else "too few frames")
+                  + (f"  ±{sr.rpm_err:.0f}" if sr and sr.rpm_err is not None else ""))
+            if k == 0:
+                spin = sr
+        seg0 = [patches[d.frame] for d in segs[0]][:24]
+        if seg0:
+            tiles = [cv2.resize(p.astype(np.uint8), (96, 96), interpolation=cv2.INTER_NEAREST) for p in seg0]
+            while len(tiles) % 12:
+                tiles.append(np.zeros_like(tiles[0]))
+            cv2.imwrite(str(out / "spin_patches.jpg"),
+                        np.vstack([np.hstack(tiles[i:i + 12]) for i in range(0, len(tiles), 12)]))
+
     if args.publish:
-        body = json.dumps({"speed_mps": shot.speed_2d, "speed_err_mps": shot.speed_2d_err}).encode()
+        payload = {"speed_mps": shot.speed_2d, "speed_err_mps": shot.speed_2d_err}
+        if spin and spin.reliable:
+            payload.update(rpm=spin.rpm, rpm_err=spin.rpm_err)
+        body = json.dumps(payload).encode()
         req = urllib.request.Request(args.publish.rstrip("/") + "/shot", data=body,
                                      headers={"Content-Type": "application/json"})
         try:

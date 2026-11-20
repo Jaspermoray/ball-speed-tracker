@@ -14,6 +14,24 @@ Stream live 240 fps video from a **Pixel 9a** to a **MacBook (macOS)** and analy
 - No Homebrew. scrcpy and adb come from the GitHub release in `tools/scrcpy-macos-aarch64-v5.0.1/`, and Python packages are in `.venv/` (av, numpy, pillow, opencv-python).
 - Frames arrive rotated 90° (sensor orientation). Indoor test frames show motion blur, so shutter speed is still the top risk.
 
+### Spin (2026-11-20)
+
+`tracker/spin.py`: a full 3D spin estimate from the natural seam and logo texture, with no dots needed.
+- **Method:**
+  - Orthographic sphere patches (`ball_patch`: centre from the ellipse fit, radius from the minor axis).
+  - **`remove_static`** divides each patch by the per-pixel mean over the flight, removing shading, rim and blur smear. Without it, "no spin" wins: in the first test, zero spin scored 0.47 and the truth 0.08.
+  - High-pass texture, then masked NCC of patch i at p against patch j at Rot(w·dt)p, over pairs with gaps 1–3.
+  - Search: a coarse lattice over all rotation vectors up to 6000 rpm (R=8 patches, h=0.15 rad/frame), 8 distinct peaks, plus a 1-D topspin/backspin scan seed (needed: the coarse grid missed 3600 rpm topspin). Refine on R=12 (4 rounds), rescore all candidates on R=20 with 40 pairs, take the slowest among near-ties (within 0.02; this resolves the half-turn seam look-alike that read 1200 rpm sidespin as 6126), then a final R=20 refinement. Candidates above max_rpm are discarded.
+  - Error comes from refining on two halves of the pairs.
+  - Reliable if match ≥ 0.25, margin ≥ 0.04 and error ≤ max(100, 8%).
+  - Components are named relative to the image-plane flight direction: topspin is positive when the top of the ball moves along the flight.
+  - Pairs with the same time gap share one rotation of the sphere points (`_score`), the main speed-up: the live spin estimate dropped from 7.5 s to about 2.5 s.
+- **Validation:** `tests/test_spin.py` (synthetic renderer `tests/synthetic_ball.py`: real seam curve, logo, felt texture, Lambert shading, exposure-integrated blur, noise, H.264) passes 13/13. At 0.5 ms exposure, sharp cases are within 2% with the right direction and component split, 300–3600 rpm, 28–36 px balls. At 1.5 ms, cases are right or flagged unreliable. **Blur is the limit:** at 1.5 ms (20 m/s gives a 16 px smear plus 20–30° of rotation during the exposure), most cases are unmeasurable.
+- **Real footage:** the throw240 roll segment measured 268 rpm against 249–359 rpm for rolling without slipping (2D and 3D speeds). The first arc of the toss measured about 134 rpm, with no independent check.
+- **Size bias fixed:** the colour mask loses about 1 px of rim, so detections add `EDGE_PX = 1.0` to both axes. Before this, synthetic speeds read 3–4% high; they now read within 2% (real clips dropped about 3%, for example 9.2 → 8.9 mph).
+- **Stall diagnosis:** if no packet arrives for 4 s, the `live.py` watchdog calls `device_health.phone_state()` and prints the cause (not on power, so Stay awake is inactive; asleep or locked; Stay awake off). `start.py` warns when the phone isn't powered. `ScrcpyCamera` kills leftover project camera servers (`video_source=camera.*camera_high_speed`) before launching. That's why two concurrent trackers stop each other.
+- **Live:** `ShotDetector` keeps unsmoothed crops (`Crop.raw`), reports speed first (`on_shot`) and then spin (`on_spin`). `DisplayServer.update(id, rpm=...)` sends an SSE `update` event, and the page fills in RPM on the same reading. `live.py --no-spin` disables spin.
+
 ### Packaging (2026-11-20)
 
 - The repo is set up for open source: `README.md` (user directions), MIT `LICENSE` (copyright name still a placeholder), `requirements.txt` and `.gitignore`. The `.gitignore` excludes videos (Pixel clips carry GPS metadata), recordings, analysis output, `.venv` and `tools/`.
@@ -37,7 +55,7 @@ Stream live 240 fps video from a **Pixel 9a** to a **MacBook (macOS)** and analy
 | `analyze_clip.py` | Runs the detector on an MP4 (handles phone slow-motion files via `com.android.capture.fps`) and writes `analysis/<clip>/`: detections.csv, overlay.jpg, crops.jpg. `--publish` sends the speed to the display |
 | `live.py` | **Live tracker:** phone stream → shot detection → speed on the display. `--serial` for Ethernet, `--file X --fast` replays a clip as if live, `--min-mph` stops rolls being published |
 | `tracker/live_shots.py` | `ShotDetector`: a per-frame trigger at 1/4 scale (480x270; starts on 3 of 5 frames with a moving ball), full-res crops around the ball during a shot (cached BGR conversion, plus a reference frame ~15 ms earlier and the background), and a worker thread that runs the full detector on the crops when the ball is gone or still for 0.3 s (cap 3 s) |
-| Live preview | `live.py` encodes the newest frame as a 640x360 JPEG at about 15 fps (its own thread; about 33 KB per frame, 3.6 Mbps), drawing the trigger's ball ring, a SHOT tag, and the last shot's path for 4 s. `DisplayServer.set_preview()` serves it at `/video.mjpg`. The page shows it bottom-right beside the RPM row (16vw on screens 3:2 or narrower; hidden in portrait). V toggles it; it auto-retries every 3 s, so it appears when the tracker starts. `--no-preview` turns it off |
+| Live preview | `live.py` encodes the newest frame as a 640x360 JPEG at about 15 fps on its own thread. It holds a frame reference (not `id()`, since addresses get reused), snapshots `det.recent_hits` (cleared concurrently at shot end; an IndexError used to kill the thread), and skips and logs any frame that fails. The server offers `/frame.jpg` (latest JPEG, 503 if more than 3 s old), `/status` and `/video.mjpg`. **The page polls `/frame.jpg` at about 12 fps and swaps blob URLs.** An MJPEG `<img>` proved unreliable: an empty box in Chrome, and Safari load events are flaky. The box shows only while frames arrive, bottom-right beside RPM, 16vw at 3:2 or narrower and 22vw in portrait, never hidden by window shape. V hides it, and the footer then says "camera hidden (V)". `--no-preview` turns it off |
 
 **First real-ball test (2026-11-20, `PXL_20261120_161336298.mp4`):** Pixel camera-app slow motion, indoors: 120 fps capture stored with 30 fps timestamps, ball about 1.7 m away and about 60 px across.
 - The ball was found in all 145 in-view frames, with ellipse fits tight even next to a hand.

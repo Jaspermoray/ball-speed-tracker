@@ -142,6 +142,10 @@ def check_phone(serial: str):
     model = out.strip().splitlines()[-1] if out.strip() else "phone"
     say(f"Phone: {model} via {'network ' + serial if ':' in serial else 'USB'}")
 
+    pw = adb("shell", "dumpsys battery | grep -c 'powered: true'", serial=serial).stdout.strip()
+    if pw == "0":
+        warn("The phone is NOT on power. Stay awake only works while charging, so it will fall "
+             "asleep and the camera will stop. Plug a charger/power bank into the hub's charging port.")
     stay = re.search(r"^\s*(\d+)\s*$", out, re.M)
     if stay and stay.group(1) == "0":
         warn("Stay awake is off. Turn it on (Settings → System → Developer options → Stay awake), "

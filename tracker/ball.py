@@ -46,6 +46,12 @@ def background_median(frames: list[np.ndarray], step: int = 4) -> np.ndarray:
     return np.median(sample, axis=0).astype(np.uint8)
 
 
+# The colour mask loses the soft rim of the ball (edge pixels are part ball,
+# part background), so ellipse axes come out about 1 px short. Measured on
+# synthetic clips with known size (28 and 36 px balls); without this, speeds
+# read 3-4% high because the ball is the ruler.
+EDGE_PX = 1.0
+
 RECENT_S = 0.015          # "moved recently" = differs from the frame ~15 ms earlier
 CAMERA_MOTION_FRAC = 0.25  # if this much of the frame changed, the camera moved: skip
 
@@ -115,7 +121,7 @@ def detect(bgr: np.ndarray, bg: np.ndarray, frame: int, t: float,
             score /= 1 + dist / 50
         if score > best_score:
             best_score = score
-            best = Detection(frame, t, cx, cy, dmin, dmaj, ang, int(area))
+            best = Detection(frame, t, cx, cy, dmin + EDGE_PX, dmaj + EDGE_PX, ang, int(area))
     return best
 
 

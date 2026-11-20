@@ -1,13 +1,14 @@
 # Ball Speed Tracker
 
-Measure tennis ball speed live with an Android phone's **240 fps** slow-motion camera and a laptop. The speed shows up on a big full-screen display you can read from across the court, a moment after each shot.
+Measure tennis ball **speed and spin (RPM)** live with an Android phone's **240 fps** slow-motion camera and a laptop. The readings show up on a big full-screen display you can read from across the court, a moment after each shot.
 
 - **No app to install on the phone.** The video streams over USB or a long Ethernet cable using [scrcpy](https://github.com/Genymobile/scrcpy).
 - **Uses the phone's real frame timestamps,** so dropped or uneven frames can't skew the speed.
 - **Calibrates itself from the ball,** which is 6.7 cm across, so there's no setup measuring.
 - **Built-in physics check:** for each flight it reports the measured gravity, which should come out near 9.81 m/s².
+- **Spin from the ball's own seams and logo,** with no marked ball needed. It gives the full 3D spin, split into topspin/backspin, sidespin and rifle spin. When the footage is too blurred to be sure, it says so instead of guessing.
 
-> **Status:** speed works. Spin (RPM) is planned but not implemented yet; the display shows "—" for RPM.
+> **Status:** speed and spin both work. Spin needs **bright light**: indoors the ball is blurred, and the spin is usually flagged unreliable and shown as "—". On real footage, spin has so far only been checked against a rolling ball (physics predicts 250–360 RPM; measured 268), not a radar or launch monitor.
 
 ---
 
@@ -85,7 +86,7 @@ The stream needs about 100 Mbps, sustained. In testing, the phone's hotspot carr
 
 - **Side-on.** Speed is measured across the picture, so put the camera at right angles to the ball's path. Motion toward or away from the camera is under-counted.
 - **3–5 m from the ball's path.** At that distance the ball stays in view for many frames and is large enough to measure. Too close, and it crosses the frame in a few frames.
-- **Bright light.** At 240 fps each exposure is very short. Outdoors in daylight is ideal; dim rooms make the ball dark and grainy.
+- **Bright light.** At 240 fps each exposure is very short. Outdoors in daylight is ideal; dim rooms make the ball dark and grainy. **Spin especially needs it:** the seams must stay sharp, which means a short exposure (under about 1 ms), and that only happens in strong light.
 - **Steady camera** (a tripod or a solid surface), **landscape** orientation.
 - **Plain background** if you can. Keep other yellow-green moving things out of the frame.
 
@@ -111,7 +112,12 @@ Each shot prints a line in the terminal, such as:
 ```
 [shot 2] 9.0 mph ±0.0 (3D 9.1; frames 833-886, n=54, gravity 11.7; all segments: 9.0, 9.4, 9.4; ...)
 ```
-- The **headline speed** is the ball's first flight, before any bounce. That's what goes to the display.
+- The **headline speed** is the ball's first flight, before any bounce. That's what goes to the display, straight away.
+- A second line follows a second or two later with the **spin**, which the display adds to the same reading:
+  ```
+  [shot 2] spin: 2933 rpm (2514 topspin, 1508 side, 88 rifle; match 0.34, margin 0.30)
+  ```
+  *match* is how well the ball's surface pattern lines up between frames, and *margin* is how much better the answer fits than the next-best one. If either is too low, or the error is too large, the spin is marked **UNRELIABLE** and the display shows "—" for RPM rather than a doubtful number.
 - **gravity** is the measured downward acceleration. Near 9.81 means the camera was level and side-on, and the measurement is consistent. A value far off usually means the ball was moving toward or away from the camera.
 - **3D** is a rough cross-check from the ball's changing apparent size. It's noisy; trust the headline speed when the camera is side-on.
 - Shots under 3 mph (rolls, nudges) aren't sent to the display; change this with `./start.sh --min-mph 5`.
@@ -155,6 +161,7 @@ Phone slow-motion files store 120 or 240 fps footage with 30 fps timestamps. The
 | `gaps>6ms` above 0 during a session | The phone dropped frames. Check `thermal=` in `receiver.py` output, and keep the phone cool and powered. |
 | Speeds look too high | Check `overlay.jpg`: the ball should be fully outlined. Dark scenes give partial detections, so add light. |
 | No shots detected | Use an optic-yellow ball in good light, and keep the camera steady. Wait 2 s after starting. |
+| RPM always "—" (spin UNRELIABLE) | The ball is too blurred to see its seams. Add light (outdoors in sun), or move the camera so the ball is bigger in the frame (closer, but keep it side-on). |
 
 Diagnostic tools:
 - `.venv/bin/python receiver.py --serial <serial>` streams and prints frame-rate, bit-rate, lag and phone battery and temperature, with no detection.
@@ -168,8 +175,15 @@ Diagnostic tools:
 2. **Trigger.** Every frame is checked at ¼ resolution (480×270) for an optic-yellow blob that differs from the background *and* moved in the last ~15 ms. This takes under 1 ms per frame.
 3. **Measurement.** During a shot, full-resolution crops around the ball are kept. When the ball leaves the frame or stops, an ellipse is fitted to the ball in each crop. Its centre is the position, at sub-pixel accuracy. Its short axis is the true diameter, because motion blur only stretches the long axis, and that gives the scale in each frame.
 4. **Speed.** The track is split at bounces, and each flight is fitted against time: straight-line motion horizontally, a parabola vertically for gravity. Positions are converted to metres using the 6.7 cm ball diameter.
+5. **Spin.** Each frame's ball image is mapped onto a sphere. Parts that don't turn with the ball are divided out: the lighting, the darker rim, and the motion-blur smear. The estimator then searches every spin axis and rate up to 6,000 RPM for the steady spin that best carries the seams and logo from each frame to the frames 1, 2 and 3 later. A coarse 3D grid search is followed by refinement. Checking several frame gaps at once rejects look-alike answers (a tennis seam looks the same after a half turn about some axes). When two answers fit about equally, the slower one wins.
 
-**Accuracy and limits.** The measurement is two-dimensional, across the picture, so it's accurate only when the camera is side-on to the flight. In testing, measured gravity came out within 1–10% of 9.81 m/s² on clean flights. The result hasn't yet been checked against a radar gun. Motion blur at serve speeds is the main open risk: shoot in bright light.
+**Accuracy and limits.**
+- **Speed** is measured two-dimensionally, across the picture, so it's accurate only when the camera is side-on to the flight. On synthetic clips with a known answer it's within 2% (usually under 1%). On real clips, measured gravity came out within 1–10% of 9.81 m/s².
+- **Spin**, on synthetic clips with a 0.5 ms exposure, is within 2% for topspin, backspin, sidespin, kick-serve mixtures, 300–3,600 RPM, and balls 28 px across. With an indoor-like 1.5 ms exposure it's either right or flagged unreliable. The practical limit at 240 fps is about 4,000 RPM.
+- **Neither has been checked against a radar gun or launch monitor yet.**
+- **Motion blur is the main risk:** shoot in bright light.
+
+**Tests.** `.venv/bin/python tests/test_spin.py` renders synthetic 240 fps clips of a spinning tennis ball, with the real seam curve, a logo, lighting, motion blur, noise and H.264 compression. It then runs the full pipeline on them and checks speed and spin against the truth. It takes about a minute; use `--quick` for 4 cases. `tests/synthetic_ball.py` renders single clips, for example `--topspin=2500 --side=1500 --exposure=0.5`.
 
 ## Project layout
 
@@ -181,6 +195,8 @@ Diagnostic tools:
 | `tracker/scrcpy_client.py` | Minimal scrcpy client (protocol for scrcpy 5.0.1) |
 | `tracker/ball.py` | Ball detection, tracking, flight fitting |
 | `tracker/live_shots.py` | Two-stage live shot detector |
+| `tracker/spin.py` | Spin (RPM and axis) from the ball's surface pattern |
+| `tests/` | Synthetic spinning-ball renderer and the end-to-end speed and spin test |
 | `tracker/display.py`, `display/index.html` | Display server (live updates and camera preview) and page |
 | `receiver.py`, `link_setup.py`, `analyze_pts.py`, `display_server.py`, `send_shot.py` | Diagnostics and testing tools |
 | `TENNIS_TRACKER_HANDOFF.md` | Development notes: design decisions, measurements, gotchas |
